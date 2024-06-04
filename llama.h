@@ -512,6 +512,7 @@ extern "C" {
                      const float * data,
                           size_t   len,
                          int32_t   n_embd,
+                         int32_t   n_dirs,
                          int32_t   il_start,
                          int32_t   il_end);
 

@@ -2391,6 +2391,7 @@ std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_par
                                              cvec.data.data(),
                                              cvec.data.size(),
                                              cvec.n_embd,
+                                             1,
                                              params.control_vector_layer_start,
                                              params.control_vector_layer_end);
         if (err) {

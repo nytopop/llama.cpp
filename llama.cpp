@@ -2261,6 +2261,7 @@ struct llama_control_vector {
 
     int32_t layer_start = -1;
     int32_t layer_end   = -1;
+    int32_t n_dirs      = -1;
 
     ggml_tensor * tensor_for(int il) const {
         if (il < 0 || il < layer_start || il > layer_end || (size_t) il >= tensors.size()) {
@@ -6997,6 +6998,32 @@ static struct ggml_tensor * llm_build_norm(
     return cur;
 }
 
+struct ggml_tensor * llm_build_control(struct ggml_context * ctx, struct ggml_tensor * cur,
+                                                                  struct ggml_tensor * r_hat)
+{
+    if (r_hat == nullptr) {
+        return cur;
+    }
+
+    struct ggml_tensor * out;
+
+    // [embd toks] x [embd dirs] -> [toks dirs]
+    out = ggml_mul_mat(ctx, cur, r_hat);
+
+    // negative dots shouldn't be projected
+    out = ggml_relu(ctx, out);
+
+    // [dirs toks] x [dirs embd] -> [toks embd]
+    out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, out)),
+                            ggml_cont(ctx, ggml_transpose(ctx, r_hat)));
+
+    // [toks embd] -> [embd toks]
+    out = ggml_scale(ctx, ggml_cont(ctx, ggml_transpose(ctx, out)), -1.0f);
+    cur = ggml_add(ctx, cur, out);
+
+    return cur;
+}
+
 static struct ggml_tensor * llm_build_ffn(
         struct ggml_context * ctx,
          struct ggml_tensor * cur,
@@ -7771,6 +7798,9 @@ struct llm_build_context {
                         Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
             }
 
+            struct ggml_tensor * dir = lctx.cvec.tensor_for(il);
+            cur = llm_build_control(ctx0, cur, dir);
+
             if (il == n_layer - 1) {
                 // skip computing output for unused tokens
                 struct ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -7815,13 +7845,11 @@ struct llm_build_context {
                 cb(cur, "ffn_moe_out", il);
             }
 
+            cur = llm_build_control(ctx0, cur, dir);
+
             cur = ggml_add(ctx0, cur, ffn_inp);
             cb(cur, "ffn_out", il);
 
-            ggml_tensor * layer_dir = lctx.cvec.tensor_for(il);
-            if (layer_dir != nullptr) {
-                cur = ggml_add(ctx0, cur, layer_dir);
-            }
             cb(cur, "l_out", il);
 
             // input for next layer
@@ -16898,7 +16926,7 @@ int32_t llama_model_apply_lora_from_file(const struct llama_model * model, const
     }
 }
 
-static bool llama_control_vector_init(struct llama_control_vector & cvec, const llama_model & model) {
+static bool llama_control_vector_init(struct llama_control_vector & cvec, const llama_model & model, int32_t n_dirs) {
     GGML_ASSERT(cvec.tensors.empty());
     GGML_ASSERT(cvec.ctxs.empty());
     GGML_ASSERT(cvec.bufs.empty());
@@ -16928,10 +16956,9 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
 
     // make tensors
     cvec.tensors.reserve(model.hparams.n_layer);
-    cvec.tensors.push_back(nullptr); // there's never a tensor for layer 0
-    for (size_t il = 1; il < model.hparams.n_layer; il++) {
+    for (size_t il = 0; il < model.hparams.n_layer; il++) {
         struct ggml_context * ctx = ctx_map.at(model.buft_layer[il].buft);
-        ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, model.hparams.n_embd);
+        ggml_tensor * tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, model.hparams.n_embd, n_dirs);
         cvec.tensors.push_back(tensor);
     }
 
@@ -16954,7 +16981,7 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
     return true;
 }
 
-int32_t llama_control_vector_apply(struct llama_context * lctx, const float * data, size_t len, int32_t n_embd, int32_t il_start, int32_t il_end) {
+int32_t llama_control_vector_apply(struct llama_context * lctx, const float * data, size_t len, int32_t n_embd, int32_t n_dirs, int32_t il_start, int32_t il_end) {
     const llama_model & model = lctx->model;
     llama_control_vector & cvec = lctx->cvec;
 
@@ -16970,8 +16997,21 @@ int32_t llama_control_vector_apply(struct llama_context * lctx, const float * da
         return 1;
     }
 
+    if (!cvec.tensors.empty() && n_dirs != cvec.n_dirs) {
+        for (struct ggml_context * ctx : cvec.ctxs) {
+            ggml_free(ctx);
+        }
+        for (ggml_backend_buffer_t buf : cvec.bufs) {
+            ggml_backend_buffer_free(buf);
+        }
+
+        cvec.tensors.clear();
+        cvec.ctxs.clear();
+        cvec.bufs.clear();
+    }
+
     if (cvec.tensors.empty()) {
-        if (!llama_control_vector_init(cvec, model)) {
+        if (!llama_control_vector_init(cvec, model, n_dirs)) {
             return 1;
         }
     }
@@ -16979,12 +17019,18 @@ int32_t llama_control_vector_apply(struct llama_context * lctx, const float * da
     cvec.layer_start = il_start;
     cvec.layer_end   = il_end;
 
-    for (size_t il = 1; il < model.hparams.n_layer; il++) {
+    for (size_t il = 0; il < model.hparams.n_layer; il++) {
         assert(cvec.tensors[il] != nullptr);
 
-        const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
-        if (off + n_embd <= len) {
-            ggml_backend_tensor_set(cvec.tensors[il], data + off, 0, n_embd * ggml_element_size(cvec.tensors[il]));
+        const size_t off = n_embd * n_dirs * il;
+
+        if (off + (n_embd * n_dirs) <= len) {
+            ggml_backend_tensor_set(
+                cvec.tensors[il],
+                data + off,
+                0,
+                n_embd * n_dirs * ggml_element_size(cvec.tensors[il])
+            );
         }
     }
 

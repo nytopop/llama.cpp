@@ -596,6 +596,7 @@ if (LLAMA_HIPBLAS)
 
     message(STATUS "HIP and hipBLAS found")
 
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
     set(GGML_HEADERS_ROCM ggml-cuda.h)
 
     file(GLOB GGML_SOURCES_ROCM "ggml-cuda/*.cu")
