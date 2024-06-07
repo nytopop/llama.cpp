@@ -12956,11 +12956,17 @@ static void llama_kv_cache_update_internal(struct llama_context & lctx) {
 
     // defragment the KV cache if needed
     if (lctx.kv_self.do_defrag) {
-        llama_kv_cache_defrag_internal(lctx);
+        uint32_t i = lctx.kv_self.size - 1;
+        uint32_t j = i - (lctx.kv_self.size - lctx.kv_self.used);
 
-        need_reserve = true;
+        while (i > j) {
+            llama_kv_cache_defrag_internal(lctx);
 
-        lctx.kv_self.do_defrag = false;
+            for (; lctx.kv_self.cells[i].is_empty(); --i) {}
+
+            need_reserve = true;
+            lctx.kv_self.do_defrag = false;
+        }
     }
 
     // reserve a worst case graph again
