@@ -443,6 +443,7 @@ if (GGML_HIPBLAS)
 
     message(STATUS "HIP and hipBLAS found")
 
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
     file(GLOB   GGML_HEADERS_ROCM "ggml-cuda/*.cuh")
     list(APPEND GGML_HEADERS_ROCM "../include/ggml-cuda.h")
 
